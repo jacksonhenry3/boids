@@ -1,22 +1,18 @@
-// Flocking boids example with gpu compute update pass
-// adapted from https://github.com/austinEng/webgpu-samples/blob/master/src/examples/computeBoids.ts
+mod data_structure;
 
+use data_structure::{GPU_data, Particle};
 use nanorand::{Rng, WyRand};
-use std::{borrow::Cow, future::Future, mem};
+use std::{borrow::Cow, future::Future};
 use wgpu::util::DeviceExt;
 use winit::{
     event::{self, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
 };
 
-// number of boid particles to simulate
-
-const NUM_PARTICLES: u32 = 10000;
-const NUM_F32_PER_PARTICLE: u32 = 6;
+const NUM_PARTICLES: u32 = 5000;
 
 // number of single-particle calculations (invocations) in each gpu work group
-
-const PARTICLES_PER_GROUP: u32 = 32;
+const PARTICLES_PER_GROUP: u32 = 256;
 
 /// Example struct holds references to wgpu resources and frame persistent data
 struct Example {
@@ -37,77 +33,56 @@ impl Example {
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
     ) -> Self {
+        //import the shaders
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("compute.wgsl"))),
         });
+
         let draw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("draw.wgsl"))),
         });
 
-        // buffer for simulation parameters uniform
-
-        let sim_param_data = [
-            0.004f32, // deltaT
+        let sim_param_data = vec![
+            0.005f32, // deltaT
             0.1,      // rule1Distance
             0.025,    // rule2Distance
             0.025,    // rule3Distance
             0.02,     // rule1Scale
             0.05,     // rule2Scale
             0.005,    // rule3Scale
-        ]
-        .to_vec();
-        let sim_param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Simulation Parameter Buffer"),
-            contents: bytemuck::cast_slice(&sim_param_data),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        ];
+
+        let sim_param: GPU_data<f32> = GPU_data::new(sim_param_data);
+
+        let particles = GPU_data::new(
+            (0..NUM_PARTICLES)
+                .map(|i| {
+                    let x = (i % ((NUM_PARTICLES as f32).sqrt() as u32)) as f32
+                        / (NUM_PARTICLES as f32).sqrt()
+                        * 2.0
+                        - 1.0;
+                    let y = (i / ((NUM_PARTICLES as f32).sqrt() as u32)) as f32
+                        / (NUM_PARTICLES as f32).sqrt()
+                        * 2.0
+                        - 1.0;
+                    Particle::new([x, y], [0.0, 0.0], ((i % 2) as f32) * 2.0 - 1.0)
+                })
+                .collect::<Vec<_>>(),
+        );
 
         // create compute bind layout group and compute pipeline layout
-
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                (sim_param_data.len() * mem::size_of::<f32>()) as _,
-                            ),
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                (NUM_PARTICLES * NUM_F32_PER_PARTICLE) as _,
-                            ),
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                (NUM_PARTICLES * NUM_F32_PER_PARTICLE) as _,
-                            ),
-                        },
-                        count: None,
-                    },
+                    sim_param.bind_group_layout(0, false, false),
+                    particles.bind_group_layout(1, true, true),
+                    particles.bind_group_layout(2, false, true),
                 ],
                 label: None,
             });
+
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("compute"),
@@ -131,12 +106,7 @@ impl Example {
                 module: &draw_shader,
                 entry_point: "main_vs",
                 buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: (std::mem::size_of::<f32>() * (NUM_F32_PER_PARTICLE as usize))
-                            as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
-                    },
+                    Particle::desc(),
                     wgpu::VertexBufferLayout {
                         array_stride: (std::mem::size_of::<f32>() * 2) as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
@@ -173,64 +143,42 @@ impl Example {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        // buffer for all particles data of type [(posx,posy,velx,vely),...]
-
-        let mut initial_particle_data =
-            vec![0.0f32; (NUM_F32_PER_PARTICLE * NUM_PARTICLES) as usize];
-        let mut rng = WyRand::new_seed(42);
-        let mut unif = || rng.generate::<f32>() * 2f32 - 1f32; // Generate a num (-1, 1)
-        for (i, particle_instance_chunk) in initial_particle_data
-            .chunks_exact_mut(NUM_F32_PER_PARTICLE as usize)
-            .enumerate()
-        {
-            particle_instance_chunk[0] = unif(); // posx
-            particle_instance_chunk[1] = unif(); // posy
-            particle_instance_chunk[2] = 0.0; // velx
-            particle_instance_chunk[3] = 0.0; // vely
-            particle_instance_chunk[4] = ((i % 2) as f32) * 2.0 - 1.0; // charge
-        }
-
-        // println!("initial_particle_data: {:?}", initial_particle_data);
-
         // creates two buffers of particle data each of size NUM_PARTICLES
         // the two buffers alternate as dst and src for each frame
 
-        let mut particle_buffers = Vec::<wgpu::Buffer>::new();
+        let particle_buffers = vec![
+            particles.buffer(device, "particle_buffer_0"),
+            particles.buffer(device, "particle_buffer_1"),
+        ];
+
         let mut particle_bind_groups = Vec::<wgpu::BindGroup>::new();
-        for i in 0..2 {
-            particle_buffers.push(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Particle Buffer {i}")),
-                    contents: bytemuck::cast_slice(&initial_particle_data),
-                    usage: wgpu::BufferUsages::VERTEX
-                        | wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST,
-                }),
-            );
-        }
 
         // create two bind groups, one for each buffer as the src
         // where the alternate buffer is used as the dst
 
         for i in 0..2 {
-            particle_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &compute_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: sim_param_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: particle_buffers[i].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: particle_buffers[(i + 1) % 2].as_entire_binding(), // bind to opposite buffer
-                    },
-                ],
-                label: None,
-            }));
+            particle_bind_groups.push(
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &compute_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: sim_param
+                                .buffer(device, "sim_param_buffer")
+                                .as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: particle_buffers[i].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: particle_buffers[(i + 1) % 2].as_entire_binding(), // bind to opposite buffer
+                        },
+                    ],
+                    label: None,
+                }),
+            );
         }
 
         // calculates number of work groups from PARTICLES_PER_GROUP constant
@@ -250,19 +198,13 @@ impl Example {
         }
     }
 
-    /// update is called for any WindowEvent not handled by the framework
-    fn update(&mut self, _event: winit::event::WindowEvent) {
-        //empty
-    }
-
-    /// resize is called on WindowEvent::Resized events
+    fn update(&mut self, _event: winit::event::WindowEvent) {}
     fn resize(
         &mut self,
         _sc_desc: &wgpu::SurfaceConfiguration,
         _device: &wgpu::Device,
         _queue: &wgpu::Queue,
     ) {
-        //empty
     }
 
     /// render is called each frame, dispatching compute groups proportional

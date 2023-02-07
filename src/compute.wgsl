@@ -25,7 +25,7 @@ struct SimParams {
 @group(0) @binding(2) var<storage, read_write> particlesDst : array<Particle>;
 
 @compute
-@workgroup_size(32)
+@workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
   let total = arrayLength(&particlesSrc);
   let index = global_invocation_id.x;

@@ -13,8 +13,8 @@ fn main_vs(
 ) -> VertexOutput {
     let angle = -atan2(particle_vel.x, particle_vel.y);
     let pos = vec2<f32>(
-        position.x * cos(angle)*0.2 - position.y * sin(angle)*0.2,
-        position.x * sin(angle)*0.2 + position.y * cos(angle)*0.2
+        position.x * cos(angle)*0.4 - position.y * sin(angle)*0.4,
+        position.x * sin(angle)*0.4 + position.y * cos(angle)*0.4
     );
     let clip_position = vec4<f32>(pos + particle_pos, 0.0, 1.0);
     return VertexOutput(clip_position, vec2<f32>(0.0,0.0), particle_vel,0.0);
