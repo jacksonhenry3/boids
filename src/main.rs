@@ -11,11 +11,12 @@ use winit::{
 
 // number of boid particles to simulate
 
-const NUM_PARTICLES: u32 = 1500;
+const NUM_PARTICLES: u32 = 10000;
+const NUM_F32_PER_PARTICLE: u32 = 6;
 
 // number of single-particle calculations (invocations) in each gpu work group
 
-const PARTICLES_PER_GROUP: u32 = 64;
+const PARTICLES_PER_GROUP: u32 = 32;
 
 /// Example struct holds references to wgpu resources and frame persistent data
 struct Example {
@@ -29,17 +30,6 @@ struct Example {
 }
 
 impl Example {
-    fn required_limits() -> wgpu::Limits {
-        wgpu::Limits::downlevel_defaults()
-    }
-
-    fn required_downlevel_capabilities() -> wgpu::DownlevelCapabilities {
-        wgpu::DownlevelCapabilities {
-            flags: wgpu::DownlevelFlags::COMPUTE_SHADERS,
-            ..Default::default()
-        }
-    }
-
     /// constructs initial instance of Example struct
     fn init(
         config: &wgpu::SurfaceConfiguration,
@@ -59,13 +49,13 @@ impl Example {
         // buffer for simulation parameters uniform
 
         let sim_param_data = [
-            0.04f32, // deltaT
-            0.1,     // rule1Distance
-            0.025,   // rule2Distance
-            0.025,   // rule3Distance
-            0.02,    // rule1Scale
-            0.05,    // rule2Scale
-            0.005,   // rule3Scale
+            0.004f32, // deltaT
+            0.1,      // rule1Distance
+            0.025,    // rule2Distance
+            0.025,    // rule3Distance
+            0.02,     // rule1Scale
+            0.05,     // rule2Scale
+            0.005,    // rule3Scale
         ]
         .to_vec();
         let sim_param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -97,7 +87,9 @@ impl Example {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 16) as _),
+                            min_binding_size: wgpu::BufferSize::new(
+                                (NUM_PARTICLES * NUM_F32_PER_PARTICLE) as _,
+                            ),
                         },
                         count: None,
                     },
@@ -107,7 +99,9 @@ impl Example {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 16) as _),
+                            min_binding_size: wgpu::BufferSize::new(
+                                (NUM_PARTICLES * NUM_F32_PER_PARTICLE) as _,
+                            ),
                         },
                         count: None,
                     },
@@ -138,14 +132,15 @@ impl Example {
                 entry_point: "main_vs",
                 buffers: &[
                     wgpu::VertexBufferLayout {
-                        array_stride: 4 * 4,
+                        array_stride: (std::mem::size_of::<f32>() * (NUM_F32_PER_PARTICLE as usize))
+                            as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
                     },
                     wgpu::VertexBufferLayout {
-                        array_stride: 2 * 4,
+                        array_stride: (std::mem::size_of::<f32>() * 2) as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x2],
+                        attributes: &wgpu::vertex_attr_array![3 => Float32x2],
                     },
                 ],
             },
@@ -180,15 +175,22 @@ impl Example {
 
         // buffer for all particles data of type [(posx,posy,velx,vely),...]
 
-        let mut initial_particle_data = vec![0.0f32; (4 * NUM_PARTICLES) as usize];
+        let mut initial_particle_data =
+            vec![0.0f32; (NUM_F32_PER_PARTICLE * NUM_PARTICLES) as usize];
         let mut rng = WyRand::new_seed(42);
         let mut unif = || rng.generate::<f32>() * 2f32 - 1f32; // Generate a num (-1, 1)
-        for particle_instance_chunk in initial_particle_data.chunks_mut(4) {
+        for (i, particle_instance_chunk) in initial_particle_data
+            .chunks_exact_mut(NUM_F32_PER_PARTICLE as usize)
+            .enumerate()
+        {
             particle_instance_chunk[0] = unif(); // posx
             particle_instance_chunk[1] = unif(); // posy
-            particle_instance_chunk[2] = unif() * 0.1; // velx
-            particle_instance_chunk[3] = unif() * 0.1; // vely
+            particle_instance_chunk[2] = 0.0; // velx
+            particle_instance_chunk[3] = 0.0; // vely
+            particle_instance_chunk[4] = ((i % 2) as f32) * 2.0 - 1.0; // charge
         }
+
+        // println!("initial_particle_data: {:?}", initial_particle_data);
 
         // creates two buffers of particle data each of size NUM_PARTICLES
         // the two buffers alternate as dst and src for each frame
@@ -435,7 +437,7 @@ fn start(
                 log::info!("Resizing to {:?}", size);
                 config.width = size.width.max(1);
                 config.height = size.height.max(1);
-                // example.resize(&config, &device, &queue);
+                example.resize(&config, &device, &queue);
                 surface.configure(&device, &config);
             }
             event::Event::WindowEvent { event, .. } => match event {
